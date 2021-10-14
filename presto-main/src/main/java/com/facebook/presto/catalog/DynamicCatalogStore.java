@@ -13,9 +13,19 @@
  */
 package com.facebook.presto.catalog;
 
+import com.facebook.airlift.discovery.client.Announcer;
+import com.facebook.airlift.discovery.client.ServiceAnnouncement;
 import com.facebook.airlift.log.Logger;
 import com.facebook.presto.connector.ConnectorManager;
+import com.facebook.presto.execution.scheduler.NodeSchedulerConfig;
+import com.facebook.presto.metadata.Catalog;
+import com.facebook.presto.metadata.CatalogManager;
 import com.facebook.presto.metadata.StaticCatalogStoreConfig;
+import com.facebook.presto.server.PrestoServer;
+import com.facebook.presto.server.ServerConfig;
+import com.facebook.presto.spi.ConnectorId;
+import com.google.common.base.Joiner;
+import com.google.common.base.Splitter;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
@@ -28,20 +38,19 @@ import javax.ws.rs.core.MediaType;
 import javax.ws.rs.core.Response;
 import java.io.File;
 import java.io.IOException;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.Map.Entry;
-import java.util.Objects;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import static com.facebook.airlift.discovery.client.ServiceAnnouncement.serviceAnnouncement;
 import static com.facebook.presto.util.PropertiesUtil.loadProperties;
 import static com.google.common.base.MoreObjects.firstNonNull;
 import static com.google.common.base.Preconditions.checkState;
+import static com.google.common.base.Strings.nullToEmpty;
 
 @Path(value = "/api/v1/catalog")
 public class DynamicCatalogStore {
@@ -54,20 +63,28 @@ public class DynamicCatalogStore {
     public static final Map<String, CatalogInfo> CATALOG_INFO_MAP = new ConcurrentHashMap<>();
     private final ScheduledExecutorService scheduledExecutorService;
     private final StaticCatalogStoreConfig config;
+    private final CatalogManager catalogManager;
+    private final Announcer announcer;
+    private final ServerConfig serverConfig;
+    private final NodeSchedulerConfig nodeSchedulerConfig;
 
     @Inject
-    public DynamicCatalogStore(ConnectorManager connectorManager, StaticCatalogStoreConfig config) {
+    public DynamicCatalogStore(ConnectorManager connectorManager, StaticCatalogStoreConfig config, Announcer announcer, ServerConfig serverConfig, NodeSchedulerConfig nodeSchedulerConfig, CatalogManager catalogManager) {
         this(connectorManager,
                 config.getCatalogConfigurationDir(),
-                firstNonNull(config.getDisabledCatalogs(), ImmutableList.of()), config);
+                firstNonNull(config.getDisabledCatalogs(), ImmutableList.of()), config, announcer, serverConfig, nodeSchedulerConfig, catalogManager);
     }
 
-    public DynamicCatalogStore(ConnectorManager connectorManager, File catalogConfigurationDir, List<String> disabledCatalogs, StaticCatalogStoreConfig config) {
+    public DynamicCatalogStore(ConnectorManager connectorManager, File catalogConfigurationDir, List<String> disabledCatalogs, StaticCatalogStoreConfig config, Announcer announcer, ServerConfig serverConfig, NodeSchedulerConfig nodeSchedulerConfig, CatalogManager catalogManager) {
         this.connectorManager = connectorManager;
         this.catalogConfigurationDir = catalogConfigurationDir;
         this.disabledCatalogs = ImmutableSet.copyOf(disabledCatalogs);
         this.scheduledExecutorService = Executors.newScheduledThreadPool(1);
         this.config = config;
+        this.announcer = announcer;
+        this.serverConfig = serverConfig;
+        this.nodeSchedulerConfig = nodeSchedulerConfig;
+        this.catalogManager = catalogManager;
     }
 
     /**
@@ -102,7 +119,13 @@ public class DynamicCatalogStore {
     @Produces(MediaType.APPLICATION_JSON)
     public Response del(CatalogInfo catalogInfo) {
         delCatalogFile(catalogInfo);
+        delCatalogInfo(catalogInfo);
         return Response.ok().build();
+    }
+
+    private void delCatalogInfo(CatalogInfo catalogInfo) {
+        connectorManager.dropConnection(catalogInfo.getCatalogName());
+        updateConnectorIds();
     }
 
     /**
@@ -134,12 +157,8 @@ public class DynamicCatalogStore {
             log.info("current catalog is having : {}", catalogInfo.getCatalogName());
             return;
         }
-        log.info("-- Loading catalog %s --", catalogInfo.getCatalogName());
-        checkState(catalogInfo.getConnectorName() != null, "Configuration for catalog %s does not contain connector.name", catalogInfo.getCatalogName());
-        // 加载Catalog时，移除Properties中的connector.name
-        catalogInfo.getProperties().remove("connector.name");
-        connectorManager.createConnection(catalogInfo.getCatalogName(), catalogInfo.getConnectorName(), catalogInfo.getProperties());
-        log.info("-- Added catalog %s using connector %s --", catalogInfo.getCatalogName(), catalogInfo.getConnectorName());
+        loadCatalog(catalogInfo.getCatalogName(), catalogInfo.getProperties());
+        updateConnectorIds();
     }
 
     /**
@@ -225,6 +244,7 @@ public class DynamicCatalogStore {
         }
         for (File file : listFiles(catalogConfigurationDir)) {
             if (file.isFile() && file.getName().endsWith(".properties")) {
+                log.debug(Files.getNameWithoutExtension(file.getName()));
                 Map<String, String> properties = FileUtil.getAllProperties(file.getPath());
                 if (isDuplicate(new CatalogInfo(Files.getNameWithoutExtension(file.getName()), properties.get("connector.name"), null, null, properties))) {
                     continue;
@@ -232,6 +252,7 @@ public class DynamicCatalogStore {
                 loadCatalog(file);
             }
         }
+        updateConnectorIds();
         catalogsLoaded.set(true);
     }
 
@@ -298,5 +319,53 @@ public class DynamicCatalogStore {
             }
         }
         return ImmutableList.of();
+    }
+
+    private void updateConnectorIds() {
+        // get existing announcement
+        ServiceAnnouncement announcement = getPrestoAnnouncement(announcer.getServiceAnnouncements());
+
+        // get existing connectorIds
+        String property = nullToEmpty(announcement.getProperties().get("connectorIds"));
+        List<String> values = Splitter.on(',').trimResults().omitEmptyStrings().splitToList(property);
+        Set<String> connectorIds = new LinkedHashSet<>(values);
+
+        // automatically build connectorIds if not configured
+
+        List<Catalog> catalogs = catalogManager.getCatalogs();
+        // if this is a dedicated coordinator, only add jmx
+        if (serverConfig.isCoordinator() && !nodeSchedulerConfig.isIncludeCoordinator()) {
+            catalogs.stream()
+                    .map(Catalog::getConnectorId)
+                    .filter(connectorId -> connectorId.getCatalogName().equals("jmx"))
+                    .map(Object::toString)
+                    .forEach(connectorIds::add);
+        } else {
+            catalogs.stream()
+                    .map(Catalog::getConnectorId)
+                    .map(Object::toString)
+                    .forEach(connectorIds::add);
+        }
+        // build announcement with updated sources
+        ServiceAnnouncement.ServiceAnnouncementBuilder builder = serviceAnnouncement(announcement.getType());
+        for (Map.Entry<String, String> entry : announcement.getProperties().entrySet()) {
+            if (!entry.getKey().equals("connectorIds")) {
+                builder.addProperty(entry.getKey(), entry.getValue());
+            }
+        }
+        builder.addProperty("connectorIds", Joiner.on(',').join(connectorIds));
+
+        // update announcement
+        announcer.removeServiceAnnouncement(announcement.getId());
+        announcer.addServiceAnnouncement(builder.build());
+    }
+
+    private static ServiceAnnouncement getPrestoAnnouncement(Set<ServiceAnnouncement> announcements) {
+        for (ServiceAnnouncement announcement : announcements) {
+            if (null != announcement.getType() && announcement.getType().equals("presto")) {
+                return announcement;
+            }
+        }
+        throw new RuntimeException("Presto announcement not found: " + announcements);
     }
 }
