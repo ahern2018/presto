@@ -17,12 +17,9 @@ import com.facebook.airlift.discovery.client.Announcer;
 import com.facebook.airlift.discovery.client.ServiceAnnouncement;
 import com.facebook.airlift.log.Logger;
 import com.facebook.presto.connector.ConnectorManager;
-import com.facebook.presto.execution.scheduler.NodeSchedulerConfig;
 import com.facebook.presto.metadata.Catalog;
 import com.facebook.presto.metadata.CatalogManager;
 import com.facebook.presto.metadata.StaticCatalogStoreConfig;
-import com.facebook.presto.server.PrestoServer;
-import com.facebook.presto.server.ServerConfig;
 import com.facebook.presto.spi.ConnectorId;
 import com.google.common.base.Joiner;
 import com.google.common.base.Splitter;
@@ -40,9 +37,7 @@ import java.io.File;
 import java.io.IOException;
 import java.util.*;
 import java.util.Map.Entry;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -52,39 +47,50 @@ import static com.google.common.base.MoreObjects.firstNonNull;
 import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.base.Strings.nullToEmpty;
 
+/**
+ * @author ahern
+ * @date 2021/10/11 18:52
+ * @since 1.0
+ */
+
 @Path(value = "/api/v1/catalog")
 public class DynamicCatalogStore {
     private static final Logger log = Logger.get(DynamicCatalogStore.class);
     private final ConnectorManager connectorManager;
-    private final File catalogConfigurationDir;
-    private final Set<String> disabledCatalogs;
     private final AtomicBoolean catalogsLoading = new AtomicBoolean();
     private final AtomicBoolean catalogsLoaded = new AtomicBoolean();
-    public static final Map<String, CatalogInfo> CATALOG_INFO_MAP = new ConcurrentHashMap<>();
-    private final ScheduledExecutorService scheduledExecutorService;
-    private final StaticCatalogStoreConfig config;
+    private final File catalogConfigurationDir;
+    private final Set<String> disabledCatalogs;
     private final CatalogManager catalogManager;
     private final Announcer announcer;
-    private final ServerConfig serverConfig;
-    private final NodeSchedulerConfig nodeSchedulerConfig;
 
     @Inject
-    public DynamicCatalogStore(ConnectorManager connectorManager, StaticCatalogStoreConfig config, Announcer announcer, ServerConfig serverConfig, NodeSchedulerConfig nodeSchedulerConfig, CatalogManager catalogManager) {
+    public DynamicCatalogStore(ConnectorManager connectorManager, StaticCatalogStoreConfig config, Announcer announcer, CatalogManager catalogManager, DynamicCatalogStoreConfig dynamicCatalogStoreConfig) {
         this(connectorManager,
                 config.getCatalogConfigurationDir(),
-                firstNonNull(config.getDisabledCatalogs(), ImmutableList.of()), config, announcer, serverConfig, nodeSchedulerConfig, catalogManager);
+                firstNonNull(config.getDisabledCatalogs(), ImmutableList.of()),
+                dynamicCatalogStoreConfig.getAutoReload(),
+                dynamicCatalogStoreConfig.getIntervalTime(),
+                announcer,
+                catalogManager);
     }
 
-    public DynamicCatalogStore(ConnectorManager connectorManager, File catalogConfigurationDir, List<String> disabledCatalogs, StaticCatalogStoreConfig config, Announcer announcer, ServerConfig serverConfig, NodeSchedulerConfig nodeSchedulerConfig, CatalogManager catalogManager) {
+    public DynamicCatalogStore(ConnectorManager connectorManager, File catalogConfigurationDir, List<String> disabledCatalogs, Boolean autoReload, Integer intervalTime, Announcer announcer, CatalogManager catalogManager) {
         this.connectorManager = connectorManager;
         this.catalogConfigurationDir = catalogConfigurationDir;
         this.disabledCatalogs = ImmutableSet.copyOf(disabledCatalogs);
-        this.scheduledExecutorService = Executors.newScheduledThreadPool(1);
-        this.config = config;
         this.announcer = announcer;
-        this.serverConfig = serverConfig;
-        this.nodeSchedulerConfig = nodeSchedulerConfig;
         this.catalogManager = catalogManager;
+        if (autoReload) {
+            Executors.newScheduledThreadPool(1).scheduleWithFixedDelay(() -> {
+                try {
+                    reload();
+                } catch (Exception e) {
+                    log.error("reload catalog error", e);
+                }
+            }, 60, intervalTime, TimeUnit.SECONDS);
+        }
+
     }
 
     /**
@@ -96,15 +102,8 @@ public class DynamicCatalogStore {
     @POST
     @Consumes(MediaType.APPLICATION_JSON)
     @Produces(MediaType.APPLICATION_JSON)
-    public Response add(CatalogInfo catalogInfo) {
-        log.info(catalogInfo.toString());
-        try {
-            writeFile(catalogInfo);
-        } catch (IOException e) {
-            log.error("write file error", e);
-            return Response.status(500).entity("write file error").build();
-        }
-        loadCatalog(catalogInfo);
+    public Response add(CatalogInfo catalogInfo) throws IOException {
+        addCatalog(catalogInfo);
         return Response.ok().build();
     }
 
@@ -118,47 +117,44 @@ public class DynamicCatalogStore {
     @Consumes(MediaType.APPLICATION_JSON)
     @Produces(MediaType.APPLICATION_JSON)
     public Response del(CatalogInfo catalogInfo) {
-        delCatalogFile(catalogInfo);
-        delCatalogInfo(catalogInfo);
+        delCatalog(catalogInfo);
         return Response.ok().build();
     }
 
-    private void delCatalogInfo(CatalogInfo catalogInfo) {
-        connectorManager.dropConnection(catalogInfo.getCatalogName());
-        updateConnectorIds();
-    }
-
     /**
-     * 校验缓存中是否已经存在相同的Catalog
+     * 删除Catalog信息
      *
      * @param catalogInfo catalog信息
-     * @return true 存在，false 不存在
      */
-    private boolean isDuplicate(CatalogInfo catalogInfo) {
-        if (CATALOG_INFO_MAP.containsKey(catalogInfo.getCatalogName())) {
-            return !MD5Util.getInstance().MD5(CATALOG_INFO_MAP.get(catalogInfo.getCatalogName()).toString()).equals(
-                    MD5Util.getInstance().MD5(catalogInfo.toString()));
-        }
-        return false;
+    private void delCatalog(CatalogInfo catalogInfo) {
+        removeOldData(catalogInfo);
+        // update ConnectorIds
+        updateConnectorId(catalogInfo.getCatalogName(), OperateEnum.DEL);
+        catalogsLoaded.set(true);
     }
-
 
     /**
      * 增加Catalog信息
      *
      * @param catalogInfo catalog信息
      */
-    private void loadCatalog(CatalogInfo catalogInfo) {
-        if (disabledCatalogs.contains(catalogInfo.getCatalogName())) {
-            log.info("Skipping disabled catalog %s", catalogInfo.getCatalogName());
-            return;
-        }
-        if (isDuplicate(catalogInfo)) {
-            log.info("current catalog is having : {}", catalogInfo.getCatalogName());
-            return;
-        }
+    private void addCatalog(CatalogInfo catalogInfo) throws IOException {
+        removeOldData(catalogInfo);
+        writeSchemaToFile(catalogInfo);
+        writeCatalogToFile(catalogInfo);
         loadCatalog(catalogInfo.getCatalogName(), catalogInfo.getProperties());
-        updateConnectorIds();
+        updateConnectorId(catalogInfo.getCatalogName(), OperateEnum.ADD);
+        catalogsLoaded.set(true);
+    }
+
+    private void removeOldData(CatalogInfo catalogInfo) {
+        Set<String> connectorIds = getConnectorIds(getPrestoAnnouncement(announcer.getServiceAnnouncements()));
+        if (connectorIds.contains(catalogInfo.getCatalogName())) {
+            // del local file
+            delCatalogFile(catalogInfo);
+            // del Catalog cache
+            connectorManager.dropConnection(catalogInfo.getCatalogName());
+        }
     }
 
     /**
@@ -167,21 +163,8 @@ public class DynamicCatalogStore {
      * @param catalogInfo catalog信息
      */
     private void delCatalogFile(CatalogInfo catalogInfo) {
-        String filePath = "etc/catalog/" + catalogInfo.getCatalogName() + ".properties";
+        String filePath = catalogConfigurationDir + "/" + catalogInfo.getCatalogName() + ".properties";
         FileUtil.delFile(filePath);
-    }
-
-    /**
-     * 写配置文件信息
-     *
-     * @param catalogInfo catalog信息
-     * @throws IOException IO异常
-     */
-    private void writeFile(CatalogInfo catalogInfo) throws IOException {
-        writeSchemaToFile(catalogInfo);
-        if (!isDuplicate(catalogInfo)) {
-            writeCatalogToFile(catalogInfo);
-        }
     }
 
     /**
@@ -191,7 +174,7 @@ public class DynamicCatalogStore {
      * @throws IOException IO异常
      */
     private void writeCatalogToFile(CatalogInfo catalogInfo) throws IOException {
-        File file = new File("etc/catalog/" + catalogInfo.getCatalogName() + ".properties");
+        File file = new File(catalogConfigurationDir + "/" + catalogInfo.getCatalogName() + ".properties");
         if (!file.getParentFile().exists()) {
             file.getParentFile().mkdirs();
         }
@@ -222,21 +205,6 @@ public class DynamicCatalogStore {
         }
     }
 
-    public boolean areCatalogsLoaded() {
-        return catalogsLoaded.get();
-    }
-
-    public void loadCatalogs() throws Exception {
-        load();
-        scheduledExecutorService.scheduleWithFixedDelay(() -> {
-            try {
-                reload();
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
-        }, 60, config.getIntervalTime(), TimeUnit.SECONDS);
-    }
-
     private void reload() throws Exception {
         log.info("reload catalog info .");
         if (!catalogsLoading.compareAndSet(false, true)) {
@@ -245,41 +213,10 @@ public class DynamicCatalogStore {
         for (File file : listFiles(catalogConfigurationDir)) {
             if (file.isFile() && file.getName().endsWith(".properties")) {
                 log.debug(Files.getNameWithoutExtension(file.getName()));
-                Map<String, String> properties = FileUtil.getAllProperties(file.getPath());
-                if (isDuplicate(new CatalogInfo(Files.getNameWithoutExtension(file.getName()), properties.get("connector.name"), null, null, properties))) {
-                    continue;
-                }
                 loadCatalog(file);
             }
         }
-        updateConnectorIds();
-        catalogsLoaded.set(true);
-    }
-
-    public void load() throws Exception {
-        if (!catalogsLoading.compareAndSet(false, true)) {
-            return;
-        }
-        for (File file : listFiles(catalogConfigurationDir)) {
-            if (file.isFile() && file.getName().endsWith(".properties")) {
-                loadCatalog(file);
-            }
-        }
-        catalogsLoaded.set(true);
-    }
-
-    public void loadCatalogs(Map<String, Map<String, String>> additionalCatalogs)
-            throws Exception {
-        if (!catalogsLoading.compareAndSet(false, true)) {
-            return;
-        }
-        for (File file : listFiles(catalogConfigurationDir)) {
-            if (file.isFile() && file.getName().endsWith(".properties")) {
-                loadCatalog(file);
-            }
-        }
-        additionalCatalogs.forEach(this::loadCatalog);
-        catalogsLoaded.set(true);
+        reloadConnectorIds();
     }
 
     private void loadCatalog(File file) throws Exception {
@@ -305,7 +242,6 @@ public class DynamicCatalogStore {
                 connectorProperties.put(entry.getKey(), entry.getValue());
             }
         }
-        CATALOG_INFO_MAP.put(catalogName, new CatalogInfo(catalogName, connectorName, null, null, properties));
         checkState(connectorName != null, "Configuration for catalog %s does not contain connector.name", catalogName);
         connectorManager.createConnection(catalogName, connectorName, connectorProperties.build());
         log.info("-- Added catalog %s using connector %s --", catalogName, connectorName);
@@ -321,31 +257,41 @@ public class DynamicCatalogStore {
         return ImmutableList.of();
     }
 
-    private void updateConnectorIds() {
+    private void updateConnectorId(String catalogName, OperateEnum operate) {
         // get existing announcement
         ServiceAnnouncement announcement = getPrestoAnnouncement(announcer.getServiceAnnouncements());
-
         // get existing connectorIds
-        String property = nullToEmpty(announcement.getProperties().get("connectorIds"));
-        List<String> values = Splitter.on(',').trimResults().omitEmptyStrings().splitToList(property);
-        Set<String> connectorIds = new LinkedHashSet<>(values);
-
-        // automatically build connectorIds if not configured
-
-        List<Catalog> catalogs = catalogManager.getCatalogs();
-        // if this is a dedicated coordinator, only add jmx
-        if (serverConfig.isCoordinator() && !nodeSchedulerConfig.isIncludeCoordinator()) {
-            catalogs.stream()
-                    .map(Catalog::getConnectorId)
-                    .filter(connectorId -> connectorId.getCatalogName().equals("jmx"))
-                    .map(Object::toString)
-                    .forEach(connectorIds::add);
-        } else {
-            catalogs.stream()
-                    .map(Catalog::getConnectorId)
-                    .map(Object::toString)
-                    .forEach(connectorIds::add);
+        Set<String> connectorIds = getConnectorIds(announcement);
+        ConnectorId connectorId = new ConnectorId(catalogName);
+        switch (operate) {
+            case ADD:
+                connectorIds.add(connectorId.toString());
+                break;
+            case DEL:
+                connectorIds.remove(connectorId.toString());
+                break;
+            default:
+                break;
         }
+        ServiceAnnouncement.ServiceAnnouncementBuilder builder = serviceAnnouncement(announcement.getType());
+        for (Map.Entry<String, String> entry : announcement.getProperties().entrySet()) {
+            if (!entry.getKey().equals("connectorIds")) {
+                builder.addProperty(entry.getKey(), entry.getValue());
+            }
+        }
+        builder.addProperty("connectorIds", Joiner.on(',').join(connectorIds));
+        // update announcement
+        announcer.removeServiceAnnouncement(announcement.getId());
+        announcer.addServiceAnnouncement(builder.build());
+    }
+
+    private void reloadConnectorIds() {
+        // get existing announcement
+        ServiceAnnouncement announcement = getPrestoAnnouncement(announcer.getServiceAnnouncements());
+        Set<String> connectorIds = new LinkedHashSet<>();
+        // automatically build connectorIds if not configured
+        List<Catalog> catalogs = catalogManager.getCatalogs();
+        catalogs.stream().map(Catalog::getConnectorId).map(Object::toString).forEach(connectorIds::add);
         // build announcement with updated sources
         ServiceAnnouncement.ServiceAnnouncementBuilder builder = serviceAnnouncement(announcement.getType());
         for (Map.Entry<String, String> entry : announcement.getProperties().entrySet()) {
@@ -354,10 +300,16 @@ public class DynamicCatalogStore {
             }
         }
         builder.addProperty("connectorIds", Joiner.on(',').join(connectorIds));
-
         // update announcement
         announcer.removeServiceAnnouncement(announcement.getId());
         announcer.addServiceAnnouncement(builder.build());
+    }
+
+    private static Set<String> getConnectorIds(ServiceAnnouncement announcement) {
+        // get existing connectorIds
+        String property = nullToEmpty(announcement.getProperties().get("connectorIds"));
+        List<String> values = Splitter.on(',').trimResults().omitEmptyStrings().splitToList(property);
+        return new LinkedHashSet<>(values);
     }
 
     private static ServiceAnnouncement getPrestoAnnouncement(Set<ServiceAnnouncement> announcements) {

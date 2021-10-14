@@ -28,7 +28,6 @@ public class StaticCatalogStoreConfig {
 
     private File catalogConfigurationDir = new File("etc/catalog/");
     private List<String> disabledCatalogs;
-    private Integer intervalTime;
 
     @NotNull
     public File getCatalogConfigurationDir() {
@@ -54,16 +53,6 @@ public class StaticCatalogStoreConfig {
 
     public StaticCatalogStoreConfig setDisabledCatalogs(List<String> catalogs) {
         this.disabledCatalogs = (catalogs == null) ? null : ImmutableList.copyOf(catalogs);
-        return this;
-    }
-
-    public Integer getIntervalTime() {
-        return intervalTime;
-    }
-
-    @Config("catalog.interval-time")
-    public StaticCatalogStoreConfig setIntervalTime(Integer intervalTime) {
-        this.intervalTime = intervalTime;
         return this;
     }
 }

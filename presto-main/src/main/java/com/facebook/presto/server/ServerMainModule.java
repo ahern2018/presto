@@ -30,6 +30,7 @@ import com.facebook.presto.PagesIndexPageSorter;
 import com.facebook.presto.SystemSessionProperties;
 import com.facebook.presto.block.BlockJsonSerde;
 import com.facebook.presto.catalog.DynamicCatalogStore;
+import com.facebook.presto.catalog.DynamicCatalogStoreConfig;
 import com.facebook.presto.client.NodeVersion;
 import com.facebook.presto.client.ServerInfo;
 import com.facebook.presto.common.block.Block;
@@ -521,6 +522,7 @@ public class ServerMainModule
         // metadata
         jaxrsBinder(binder).bind(DynamicCatalogStore.class);
         binder.bind(DynamicCatalogStore.class).in(Scopes.SINGLETON);
+        configBinder(binder).bindConfig(DynamicCatalogStoreConfig.class);
         binder.bind(StaticCatalogStore.class).in(Scopes.SINGLETON);
         configBinder(binder).bindConfig(StaticCatalogStoreConfig.class);
         binder.bind(StaticFunctionNamespaceStore.class).in(Scopes.SINGLETON);

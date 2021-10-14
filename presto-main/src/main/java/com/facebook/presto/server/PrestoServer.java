@@ -75,28 +75,23 @@ import static com.google.common.base.Strings.nullToEmpty;
 import static java.util.Objects.requireNonNull;
 
 public class PrestoServer
-        implements Runnable
-{
-    public static void main(String[] args)
-    {
+        implements Runnable {
+    public static void main(String[] args) {
         new PrestoServer().run();
     }
 
     private final SqlParserOptions sqlParserOptions;
 
-    public PrestoServer()
-    {
+    public PrestoServer() {
         this(new SqlParserOptions());
     }
 
-    public PrestoServer(SqlParserOptions sqlParserOptions)
-    {
+    public PrestoServer(SqlParserOptions sqlParserOptions) {
         this.sqlParserOptions = requireNonNull(sqlParserOptions, "sqlParserOptions is null");
     }
 
     @Override
-    public void run()
-    {
+    public void run() {
         verifyJvmRequirements();
         verifySystemTimeIsReasonable();
 
@@ -142,7 +137,7 @@ public class PrestoServer
             ServerConfig serverConfig = injector.getInstance(ServerConfig.class);
 
             if (!serverConfig.isResourceManager()) {
-                injector.getInstance(DynamicCatalogStore.class).loadCatalogs();
+                injector.getInstance(StaticCatalogStore.class).loadCatalogs();
             }
 
             // TODO: remove this huge hack
@@ -171,20 +166,17 @@ public class PrestoServer
             injector.getInstance(Announcer.class).start();
 
             log.info("======== SERVER STARTED ========");
-        }
-        catch (Throwable e) {
+        } catch (Throwable e) {
             log.error(e);
             System.exit(1);
         }
     }
 
-    protected Iterable<? extends Module> getAdditionalModules()
-    {
+    protected Iterable<? extends Module> getAdditionalModules() {
         return ImmutableList.of();
     }
 
-    private static void updateConnectorIds(Announcer announcer, CatalogManager metadata, ServerConfig serverConfig, NodeSchedulerConfig schedulerConfig)
-    {
+    private static void updateConnectorIds(Announcer announcer, CatalogManager metadata, ServerConfig serverConfig, NodeSchedulerConfig schedulerConfig) {
         // get existing announcement
         ServiceAnnouncement announcement = getPrestoAnnouncement(announcer.getServiceAnnouncements());
 
@@ -203,8 +195,7 @@ public class PrestoServer
                         .filter(connectorId -> connectorId.getCatalogName().equals("jmx"))
                         .map(Object::toString)
                         .forEach(connectorIds::add);
-            }
-            else {
+            } else {
                 catalogs.stream()
                         .map(Catalog::getConnectorId)
                         .map(Object::toString)
@@ -226,8 +217,7 @@ public class PrestoServer
         announcer.addServiceAnnouncement(builder.build());
     }
 
-    private static void updateThriftServerPort(Announcer announcer, DriftServer driftServer)
-    {
+    private static void updateThriftServerPort(Announcer announcer, DriftServer driftServer) {
         // get existing announcement
         ServiceAnnouncement announcement = getPrestoAnnouncement(announcer.getServiceAnnouncements());
 
@@ -244,8 +234,7 @@ public class PrestoServer
         announcer.forceAnnounce();
     }
 
-    private static ServiceAnnouncement getPrestoAnnouncement(Set<ServiceAnnouncement> announcements)
-    {
+    private static ServiceAnnouncement getPrestoAnnouncement(Set<ServiceAnnouncement> announcements) {
         for (ServiceAnnouncement announcement : announcements) {
             if (announcement.getType().equals("presto")) {
                 return announcement;
