@@ -28,9 +28,9 @@ public class CatalogInfo {
     private final String tableName;
 
     /**
-     * Schema 信息(JSON数据)
+     * Table 信息(JSON数据)
      */
-    private final Object schemaInfo;
+    private final Object tableInfo;
 
     /**
      * Catalog 配置信息
@@ -42,12 +42,12 @@ public class CatalogInfo {
             @JsonProperty("catalogName") String catalogName,
             @JsonProperty("connectorName") String connectorName,
             @JsonProperty("tableName") String tableName,
-            @JsonProperty("schemaInfo") Object schemaInfo,
+            @JsonProperty("tableInfo") Object schemaInfo,
             @JsonProperty("properties")  Map<String, String> properties) {
         this.catalogName = catalogName;
         this.connectorName = connectorName;
         this.tableName = tableName;
-        this.schemaInfo = schemaInfo;
+        this.tableInfo = schemaInfo;
         this.properties = properties;
     }
 
@@ -67,8 +67,8 @@ public class CatalogInfo {
     }
 
     @JsonProperty
-    public Object getSchemaInfo() {
-        return schemaInfo;
+    public Object getTableInfo() {
+        return tableInfo;
     }
 
     @JsonProperty

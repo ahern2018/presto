@@ -190,7 +190,7 @@ public class DynamicCatalogStore {
     private void writeSchemaToFile(CatalogInfo catalogInfo) throws IOException {
         String connectorName = catalogInfo.getConnectorName();
         String tableName = catalogInfo.getTableName();
-        Object schemaInfo = catalogInfo.getSchemaInfo();
+        Object schemaInfo = catalogInfo.getTableInfo();
         if (!(StringUtils.isEmpty(connectorName) || StringUtils.isEmpty(tableName) || Objects.isNull(schemaInfo))) {
             String filePath = "etc/" + connectorName + "/" + tableName + ".json";
             File file = new File(filePath);
