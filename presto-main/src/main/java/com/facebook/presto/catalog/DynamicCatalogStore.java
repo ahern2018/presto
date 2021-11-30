@@ -243,6 +243,7 @@ public class DynamicCatalogStore {
             }
         }
         checkState(connectorName != null, "Configuration for catalog %s does not contain connector.name", catalogName);
+        connectorManager.dropConnection(catalogName);
         connectorManager.createConnection(catalogName, connectorName, connectorProperties.build());
         log.info("-- Added catalog %s using connector %s --", catalogName, connectorName);
     }
